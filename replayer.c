@@ -29,6 +29,9 @@ char reaIP[32], reaMac[32];       // my ascii ip and mac addresses
 char revIP[32], revMac[32];       // replay ascii ip and mac addresses
 char timing[32];
 char lvPort[10], laPort[10], reaPort[10], revPort[10];
+int locPort, remPort;
+
+
 
 
 /* Better timeval struct to preserve caplen and len */
@@ -88,8 +91,12 @@ int main(int argc, char **argv) {
         }
 
     readcfg(cfile);
-    //open_devices();
+    open_devices();
 
+    fd = open(logfile, O_RDONLY);
+    if (fd == -1) {
+        printf("ERROR: Could not find pcap file %s", argv[1]);
+    }
     // Precursory PCAP Header Info
     read(fd, &pcaphdr, sizeof(pcaphdr));
     printf("PCAP_MAGIC\n");
@@ -212,16 +219,14 @@ void readcfg(char *filename) {
   // Get replay victim addresses
   if ( (err = load_address(fp,revIP,revMac,&remoteIP,&remoteMac)) < 0 )
     load_error(err,"Replay victim");
-  if ( fgets(revPort, 10, fp) == NULL ) 
-    exit(-1);
-  rmnl(revPort);
+  fscanf(fp, "%d ", &remPort);
+  remPort = htons(remPort);
   
   // Get my addresses
   if ( (err = load_address(fp,reaIP,reaMac,&localIP,&localMac)) < 0 )
     load_error(err,"Replay attacker");
-  if ( fgets(reaPort, 10, fp) == NULL ) 
-    exit(-1);
-  rmnl(reaPort);
+  fscanf(fp, "%d ", &locPort);
+  locPort = htons(locPort);
 
   if ( fgets(iface, sizeof(iface), fp) == NULL ) {
     fprintf(stderr, "Interface too large\n");
@@ -290,11 +295,11 @@ void proc_pkt(const unsigned char *pack) {
 
         // Compare config info with current packet, skip if invalid
         if(addr_cmp(&curpktSIP, &logatkIP) != 0) {
-            printf("\n\n\t Packet skipped!");
+            printf("\n\t Packet skipped!\n");
             return;
         }
         if(addr_cmp(&curpktDIP, &logvicIP) != 0) {
-            printf("\n\n\t Packet skipped!");
+            printf("\n\t Packet skipped!\n");
             return;
         }
 
@@ -310,16 +315,22 @@ void proc_pkt(const unsigned char *pack) {
             tcp_hdr = (struct tcp_hdr *)(pack + ETH_HDR_LEN + IP_HDR_LEN);
             printf("\t   Src Port = %i\n", ntohs(tcp_hdr->th_sport));
             printf("\t   Dst Port = %i\n", ntohs(tcp_hdr->th_dport));
+            // Replace ports
+            tcp_hdr->th_sport = locPort;
+            tcp_hdr->th_dport = remPort;
+            printf("\t   New Src Port = %i\n", ntohs(tcp_hdr->th_sport));
+            printf("\t   New Dst Port = %i\n", ntohs(tcp_hdr->th_dport));
             printf("\t   Seq = %u\n", ntohl(tcp_hdr->th_seq));
             printf("\t   Ack = %u\n", ntohl(tcp_hdr->th_ack));
 
-            // Replace source address with attacker address and destination address
+            // Replace source address with attacker address and port
             memcpy( &eth_hdr->eth_src, &reaMac, ETH_ADDR_LEN);
             memcpy( &ip_hdr->ip_src, &reaIP, IP_ADDR_LEN);
             
-            // Replace destination address with new victim client
+            // Replace destination address with new victim client and port
             memcpy( &eth_hdr->eth_dst, &remoteMac, ETH_ADDR_LEN);
             memcpy( &ip_hdr->ip_dst, &remoteIP, IP_ADDR_LEN);
+            
 
             // Compute both ip and tcp checksums
             ip_checksum((void *)ip_hdr, ntohs(ip_hdr->ip_len));
@@ -334,7 +345,7 @@ void proc_pkt(const unsigned char *pack) {
                     }
             }
             else {
-                printf("\n\n\t   Packet Not Sent\n");
+                printf("\n\t   Packet Not Sent\n");
             }
         }
 
